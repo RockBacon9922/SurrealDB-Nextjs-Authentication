@@ -1,18 +1,18 @@
 "use client";
-import { Surreal } from "surrealdb";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
+import { getCookie } from "cookies-next/client";
+import { useRouter } from "next/navigation";
 import type React from "react";
 import {
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useMemo,
-  useCallback,
   useState,
 } from "react";
+import { Surreal } from "surrealdb";
 import { authenticate, invalidateAuth } from "@/utils/RequestSurrealToken";
-import { getCookie } from "cookies-next/client";
-import { useRouter } from "next/navigation";
 
 interface SurrealProviderProps {
   children: React.ReactNode;
@@ -30,7 +30,7 @@ interface SurrealProviderState {
   /** The connection error, if present */
   error: unknown;
   /** Connect to the Surreal instance */
-  connect: () => Promise<boolean>;
+  connect: (email?: string, password?: string) => Promise<boolean>;
   /** Close the Surreal instance */
   close: () => Promise<true>;
   /** Logout: invalidate session, clear cookies, and redirect */
@@ -47,16 +47,17 @@ export function SurrealProvider({ children }: SurrealProviderProps) {
   const queryClient = useQueryClient();
   const router = useRouter();
 
-  // React Query mutation for connecting to Surreal with your specific connection logic
-  const {
-    mutateAsync: connectMutation,
-    isPending,
-    isSuccess,
-    isError,
-    error,
-    reset,
-  } = useMutation({
-    mutationFn: async () => {
+  // Simple state management for connection
+  const [connectionState, setConnectionState] = useState({
+    isConnecting: false,
+    isSuccess: false,
+    isError: false,
+    error: null as unknown,
+  });
+
+  // Simplified connection logic
+  const connectMutation = useCallback(
+    async (email?: string, password?: string) => {
       if (
         !process.env.NEXT_PUBLIC_SURREAL_URL ||
         !process.env.NEXT_PUBLIC_SURREAL_NS ||
@@ -76,100 +77,77 @@ export function SurrealProvider({ children }: SurrealProviderProps) {
           database: process.env.NEXT_PUBLIC_SURREAL_DB,
         },
       );
-      try {
-        if (sessionToken) {
-          await surrealInstance.authenticate(sessionToken);
-        } else {
-          throw new Error("No session token found");
-        }
-      } catch {
-        try {
-          const token = await authenticate();
-          await surrealInstance.authenticate(token.token);
-        } catch {
-          // On login page or when no authentication is available, don't throw error
-          // Just close the connection and return false to indicate connection failed
-          try {
-            await surrealInstance.close();
-          } catch {
-            // Ignore close errors
-          }
-          return false;
-        }
+
+      // Try to authenticate with existing token first
+      if (sessionToken) {
+        await surrealInstance.authenticate(sessionToken);
+      } else {
+        // If no token, authenticate to get one (with optional credentials)
+        const token = await authenticate(email, password);
+        await surrealInstance.authenticate(token.token);
       }
 
       return true;
     },
-  });
+    [surrealInstance],
+  );
 
-  // Wrap mutateAsync in a stable callback
-  const connect = useCallback(async (): Promise<boolean> => {
-    try {
-      const result = await connectMutation();
-      return result ?? false;
-    } catch (err) {
-      console.error("Failed to connect to SurrealDB:", err);
-      return false;
-    }
-  }, [connectMutation]);
+  // Simplified connect function
+  const connect = useCallback(
+    async (email?: string, password?: string): Promise<boolean> => {
+      setConnectionState({
+        isConnecting: true,
+        isSuccess: false,
+        isError: false,
+        error: null,
+      });
+
+      try {
+        await connectMutation(email, password);
+        setConnectionState({
+          isConnecting: false,
+          isSuccess: true,
+          isError: false,
+          error: null,
+        });
+        return true;
+      } catch (err) {
+        setConnectionState({
+          isConnecting: false,
+          isSuccess: false,
+          isError: true,
+          error: err,
+        });
+        console.error("Failed to connect to SurrealDB:", err);
+        return false;
+      }
+    },
+    [connectMutation],
+  );
 
   // Wrap close() in a stable callback
   const close = useCallback(() => surrealInstance.close(), [surrealInstance]);
 
-  // Logout helper
+  // Simplified logout helper
   const logout = useCallback(async () => {
-    try {
-      // Invalidate auth on the client and close connection
-      try {
-        // invalidate() clears the auth token on the Surreal client
-        // It's safe to call even if not authenticated
-        if (
-          typeof (
-            surrealInstance as unknown as { invalidate?: () => Promise<void> }
-          ).invalidate === "function"
-        ) {
-          await (
-            surrealInstance as unknown as { invalidate: () => Promise<void> }
-          ).invalidate();
-        }
-      } catch (_) {
-        // noop
-      }
-      try {
-        await surrealInstance.close();
-      } catch (_) {
-        // noop
-      }
+    // Invalidate auth and close connection
+    await surrealInstance.invalidate?.();
+    await surrealInstance.close();
 
-      // Stop and clear all React Query caches
-      try {
-        await queryClient.cancelQueries();
-      } catch (_) {
-        // noop
-      }
-      queryClient.clear();
+    // Clear React Query cache
+    queryClient.clear();
 
-      // Clear cookies using server function (including httpOnly refresh cookie)
-      try {
-        await invalidateAuth();
-      } catch (error) {
-        console.error("Failed to clear cookies during logout:", error);
-      }
-    } finally {
-      // Redirect to landing page
-      router.replace("/");
-    }
+    // Clear cookies and redirect
+    await invalidateAuth();
+    router.replace("/");
   }, [queryClient, router, surrealInstance]);
 
-  // Auto-connect on mount and cleanup on unmount
+  // Cleanup on unmount
   useEffect(() => {
-    connect();
-
     return () => {
-      reset();
       surrealInstance.close();
     };
-  }, [connect, reset, surrealInstance]);
+  }, [surrealInstance]);
 
   // Removed: If connection failed, redirect to home
   // useEffect(() => {
@@ -182,20 +160,20 @@ export function SurrealProvider({ children }: SurrealProviderProps) {
   const value: SurrealProviderState = useMemo(
     () => ({
       client: surrealInstance,
-      isConnecting: isPending,
-      isSuccess,
-      isError,
-      error,
+      isConnecting: connectionState.isConnecting,
+      isSuccess: connectionState.isSuccess,
+      isError: connectionState.isError,
+      error: connectionState.error,
       connect,
       close,
       logout,
     }),
     [
       surrealInstance,
-      isPending,
-      isSuccess,
-      isError,
-      error,
+      connectionState.isConnecting,
+      connectionState.isSuccess,
+      connectionState.isError,
+      connectionState.error,
       connect,
       close,
       logout,
